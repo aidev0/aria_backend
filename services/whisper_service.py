@@ -12,11 +12,17 @@ class WhisperService:
     """OpenAI Whisper speech-to-text service for processing glasses microphone audio."""
 
     def __init__(self):
-        self.client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._client = None
         self._audio_buffer: bytearray = bytearray()
         self._sample_rate = 16000
         self._channels = 1
         self._sample_width = 2  # 16-bit audio
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "sk-placeholder"))
+        return self._client
 
     async def transcribe(
         self,
