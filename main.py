@@ -15,7 +15,6 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-# Ensure project root is on the path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from agents import (
@@ -29,30 +28,37 @@ from agents import (
 )
 from services import (
     AIService,
+    CLIService,
+    Database,
     ElevenLabsService,
     StreamService,
     WhatsAppService,
     WhisperService,
 )
+from services.ai_service import MODELS
+from services.cli_service import CLIType
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
 glasses_connections: set[WebSocket] = set()
 view_connections: set[WebSocket] = set()
 
+db = Database()
 ai_service = AIService()
+cli_service = CLIService()
 whisper_service = WhisperService()
 elevenlabs_service = ElevenLabsService()
 whatsapp_service = WhatsAppService()
 stream_service = StreamService()
 
-# Agents
-planner = PlannerAgent(ai_service)
-developer = DeveloperAgent(ai_service)
-tester = TesterAgent(ai_service)
-code_reviewer = CodeReviewerAgent(ai_service)
-deployer = DeployerAgent(ai_service)
+# Agents — each gets both ai_service and cli_service
+planner = PlannerAgent(ai_service, cli_service)
+developer = DeveloperAgent(ai_service, cli_service)
+tester = TesterAgent(ai_service, cli_service)
+code_reviewer = CodeReviewerAgent(ai_service, cli_service)
+deployer = DeployerAgent(ai_service, cli_service)
 reporter = ReporterAgent(ai_service, whatsapp_service, elevenlabs_service)
+reporter.cli_service = cli_service
 
 AGENTS = {
     AgentType.PLANNER: planner,
@@ -68,6 +74,20 @@ AGENTS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Connect MongoDB
+    await db.connect()
+
+    # Load saved agent configs from MongoDB
+    saved_configs = await db.get_agent_configs()
+    for cfg in saved_configs:
+        agent_type_str = cfg.get("agent_type")
+        try:
+            at = AgentType(agent_type_str)
+            if at in AGENTS:
+                AGENTS[at].configure(cfg)
+        except (ValueError, KeyError):
+            pass
+
     # Wire up stream service → broadcast AI responses to glasses & viewers
     async def broadcast_ai_response(response: dict):
         msg = json.dumps(response)
@@ -96,13 +116,16 @@ async def lifespan(app: FastAPI):
             })
 
     stream_service.subscribe_audio(handle_audio)
+
     yield
+
+    await db.disconnect()
 
 
 app = FastAPI(
     title="Aria AI Backend",
     description="AI development agents for Aria Glasses — plan, develop, test, review, deploy, report",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -119,13 +142,19 @@ app.add_middleware(
 
 class AgentRequest(BaseModel):
     task_input: dict[str, Any]
-    model: str = "claude"
+    model: str | None = None  # Override per-request, else uses agent config
+
+
+class AgentConfigRequest(BaseModel):
+    model: str = "claude"       # claude | gemini | openai
+    cli: str = "none"           # claude | gemini | codex | none
+    use_cli: bool = False
 
 
 class PipelineRequest(BaseModel):
     requirement: str
     context: str = ""
-    model: str = "claude"
+    model: str | None = None    # Override all agents, else each uses its own config
     whatsapp_phone: str | None = None
     deploy_target: str = "docker"
 
@@ -147,15 +176,34 @@ async def root():
     return {
         "status": "ok",
         "name": "Aria AI Backend",
-        "version": "2.0.0",
+        "version": "3.0.0",
+        "models": MODELS,
         "glasses_connected": len(glasses_connections),
         "viewers_connected": len(view_connections),
-        "agents": {k.value: v.status.value for k, v in AGENTS.items()},
+        "agents": {k.value: v.get_status() for k, v in AGENTS.items()},
         "streams": stream_service.get_stats(),
     }
 
 
-# ── REST API: Agents ──────────────────────────────────────────────────────────
+# ── REST API: Models & CLIs ──────────────────────────────────────────────────
+
+@app.get("/models")
+async def list_models():
+    return {
+        "models": [
+            {"value": "claude", "label": "Claude Opus 4.6", "model_id": MODELS["claude"]},
+            {"value": "gemini", "label": "Gemini 3.1 Pro", "model_id": MODELS["gemini"]},
+            {"value": "openai", "label": "GPT-5.4", "model_id": MODELS["openai"]},
+        ]
+    }
+
+
+@app.get("/clis")
+async def list_clis():
+    return {"clis": CLIService.available_clis()}
+
+
+# ── REST API: Agent Config ────────────────────────────────────────────────────
 
 @app.get("/agents")
 async def list_agents():
@@ -173,6 +221,36 @@ async def get_agent(agent_type: str):
     return AGENTS[at].get_status()
 
 
+@app.put("/agents/{agent_type}/config")
+async def configure_agent(agent_type: str, request: AgentConfigRequest):
+    """Set model and CLI for a specific agent. Persists to MongoDB."""
+    try:
+        at = AgentType(agent_type)
+    except ValueError:
+        return {"error": f"Unknown agent: {agent_type}"}
+
+    config = request.model_dump()
+    AGENTS[at].configure(config)
+
+    # Persist to MongoDB
+    await db.set_agent_config(agent_type, config)
+
+    return {
+        "agent_type": agent_type,
+        "config": AGENTS[at].config.model_dump(),
+        "saved": True,
+    }
+
+
+@app.get("/agents/configs/all")
+async def get_all_agent_configs():
+    """Get saved configs for all agents from MongoDB."""
+    configs = await db.get_agent_configs()
+    return {"configs": configs}
+
+
+# ── REST API: Run Agent ───────────────────────────────────────────────────────
+
 @app.post("/agents/{agent_type}/run")
 async def run_agent(agent_type: str, request: AgentRequest):
     try:
@@ -181,8 +259,11 @@ async def run_agent(agent_type: str, request: AgentRequest):
         return {"error": f"Unknown agent: {agent_type}"}
 
     agent = AGENTS[at]
-    request.task_input["model"] = request.model
     result = await agent.run(request.task_input, model=request.model)
+
+    # Save to MongoDB
+    await db.save_task_result(result.model_dump())
+
     return result.model_dump()
 
 
@@ -190,33 +271,31 @@ async def run_agent(agent_type: str, request: AgentRequest):
 
 @app.post("/pipeline/run")
 async def run_pipeline(request: PipelineRequest):
-    """Run the full development pipeline: plan → develop → test → review → deploy → report."""
+    """Run the full development pipeline: plan → develop → test → review → deploy → report.
+    Each agent uses its own configured model/CLI unless overridden in the request."""
     pipeline_results: dict[str, Any] = {}
 
     # 1. Plan
     plan_result = await planner.run({
         "requirement": request.requirement,
         "context": request.context,
-        "model": request.model,
-    })
+    }, model=request.model)
     pipeline_results["planning"] = plan_result.output_data
 
-    # Notify glasses/viewers of progress
     await stream_service.push_ai_response(
         text="Planning complete. Starting development...",
         display_data={"stage": "planning", "status": "complete"},
     )
 
-    # 2. Develop (first task from plan)
+    # 2. Develop
     plan = plan_result.output_data.get("plan", {})
     tasks = plan.get("tasks", [])
     dev_results = []
-    for task in tasks[:5]:  # Limit to first 5 tasks
+    for task in tasks[:5]:
         dev_result = await developer.run({
             "task": task,
             "plan_context": json.dumps(plan),
-            "model": request.model,
-        })
+        }, model=request.model)
         dev_results.append(dev_result.output_data)
 
     pipeline_results["development"] = dev_results
@@ -233,8 +312,7 @@ async def run_pipeline(request: PipelineRequest):
         "acceptance_criteria": [
             c for t in tasks for c in t.get("acceptance_criteria", [])
         ],
-        "model": request.model,
-    })
+    }, model=request.model)
     pipeline_results["testing"] = test_result.output_data
 
     await stream_service.push_ai_response(
@@ -247,8 +325,7 @@ async def run_pipeline(request: PipelineRequest):
         "code": dev_results,
         "tests": test_result.output_data,
         "requirements": request.requirement,
-        "model": request.model,
-    })
+    }, model=request.model)
     pipeline_results["code_review"] = review_result.output_data
 
     await stream_service.push_ai_response(
@@ -262,18 +339,15 @@ async def run_pipeline(request: PipelineRequest):
         "code": dev_results,
         "review": review_result.output_data,
         "target": request.deploy_target,
-        "model": request.model,
-    })
+    }, model=request.model)
     pipeline_results["deployment"] = deploy_result.output_data
 
     # 6. Report
     report_result = await reporter.run({
         "pipeline_results": pipeline_results,
         "whatsapp_phone": request.whatsapp_phone,
-        "model": request.model,
-    })
+    }, model=request.model)
 
-    # Send voice memo to glasses
     voice_audio = report_result.output_data.get("voice_audio")
     report_text = report_result.output_data.get("report", {}).get("voice_memo", "Pipeline complete.")
     await stream_service.push_ai_response(
@@ -282,6 +356,14 @@ async def run_pipeline(request: PipelineRequest):
         display_data=report_result.output_data.get("report", {}).get("display_notification"),
     )
 
+    # Save to MongoDB
+    await db.save_pipeline_run({
+        "requirement": request.requirement,
+        "model_override": request.model,
+        "results": pipeline_results,
+        "report": report_result.output_data,
+    })
+
     return {
         "status": "complete",
         "pipeline_results": pipeline_results,
@@ -289,39 +371,34 @@ async def run_pipeline(request: PipelineRequest):
     }
 
 
+@app.get("/pipeline/history")
+async def pipeline_history():
+    """Get recent pipeline runs from MongoDB."""
+    runs = await db.get_pipeline_runs()
+    return {"runs": runs}
+
+
 # ── REST API: Speech Services ─────────────────────────────────────────────────
 
 @app.post("/speech/tts")
 async def text_to_speech(request: TTSRequest):
-    """Convert text to speech using ElevenLabs."""
     audio = await elevenlabs_service.text_to_speech(
-        text=request.text,
-        voice_id=request.voice_id,
+        text=request.text, voice_id=request.voice_id,
     )
-    audio_b64 = base64.b64encode(audio).decode("utf-8")
-    return {"audio_base64": audio_b64, "format": "mp3"}
+    return {"audio_base64": base64.b64encode(audio).decode("utf-8"), "format": "mp3"}
 
 
 @app.post("/speech/tts/stream")
 async def text_to_speech_stream(request: TTSRequest):
-    """Stream TTS audio to glasses speaker."""
     audio = await elevenlabs_service.text_to_speech(request.text, request.voice_id)
-    await stream_service.push_ai_response(
-        text=request.text,
-        audio_data=audio,
-    )
+    await stream_service.push_ai_response(text=request.text, audio_data=audio)
     return {"status": "streamed", "text": request.text}
 
 
 @app.post("/speech/stt")
 async def speech_to_text(request: TranscribeRequest):
-    """Transcribe audio using OpenAI Whisper."""
     audio_bytes = base64.b64decode(request.audio_base64)
-    result = await whisper_service.transcribe(
-        audio_data=audio_bytes,
-        language=request.language,
-    )
-    return result
+    return await whisper_service.transcribe(audio_data=audio_bytes, language=request.language)
 
 
 # ── WebSocket: Glasses ────────────────────────────────────────────────────────
@@ -341,10 +418,8 @@ async def glasses_endpoint(websocket: WebSocket):
             msg_type = message.get("type", "")
 
             if msg_type == "frame":
-                # Video frame from glasses camera
                 frame_data = message.get("data", "")
                 await stream_service.push_video_frame(frame_data)
-                # Forward to viewers
                 for view in view_connections:
                     try:
                         await view.send_text(data)
@@ -352,22 +427,18 @@ async def glasses_endpoint(websocket: WebSocket):
                         pass
 
             elif msg_type == "audio":
-                # Audio chunk from glasses mic
                 audio_b64 = message.get("data", "")
                 audio_bytes = base64.b64decode(audio_b64)
                 await stream_service.push_audio_chunk(audio_bytes)
 
             elif msg_type == "command":
-                # Voice command (already transcribed by iOS app)
                 command_text = message.get("text", "")
                 if command_text:
-                    # Run through pipeline
                     asyncio.create_task(
-                        _handle_voice_command(command_text, message.get("model", "claude"))
+                        _handle_voice_command(command_text, message.get("model"))
                     )
 
             else:
-                # Forward unknown messages to viewers
                 for view in view_connections:
                     try:
                         await view.send_text(data)
@@ -378,36 +449,33 @@ async def glasses_endpoint(websocket: WebSocket):
         glasses_connections.discard(websocket)
 
 
-async def _handle_voice_command(command: str, model: str = "claude"):
+async def _handle_voice_command(command: str, model: str | None = None):
     """Process a voice command through the appropriate agent or pipeline."""
-    # Simple command routing
     cmd_lower = command.lower()
 
-    if any(word in cmd_lower for word in ["build", "create", "make", "develop"]):
-        result = await planner.run({"requirement": command, "model": model})
+    if any(w in cmd_lower for w in ("build", "create", "make", "develop")):
+        result = await planner.run({"requirement": command}, model=model)
         text = json.dumps(result.output_data.get("plan", {}).get("summary", "Plan created."))
-    elif any(word in cmd_lower for word in ["test", "check", "verify"]):
-        result = await tester.run({"code": command, "model": model})
+    elif any(w in cmd_lower for w in ("test", "check", "verify")):
+        result = await tester.run({"code": command}, model=model)
         text = "Tests generated."
-    elif any(word in cmd_lower for word in ["review", "look at"]):
-        result = await code_reviewer.run({"code": command, "model": model})
+    elif any(w in cmd_lower for w in ("review", "look at")):
+        result = await code_reviewer.run({"code": command}, model=model)
         text = "Code review complete."
-    elif any(word in cmd_lower for word in ["deploy", "ship", "release", "launch"]):
-        result = await deployer.run({"project": command, "model": model})
+    elif any(w in cmd_lower for w in ("deploy", "ship", "release", "launch")):
+        result = await deployer.run({"project": command}, model=model)
         text = "Deployment plan ready."
-    elif any(word in cmd_lower for word in ["status", "report", "how"]):
+    elif any(w in cmd_lower for w in ("status", "report", "how")):
         statuses = {k.value: v.status.value for k, v in AGENTS.items()}
         text = f"Agent statuses: {json.dumps(statuses)}"
     else:
-        # Default: treat as a full pipeline request
         response = await ai_service.generate(
             prompt=command,
             system_prompt="You are Aria, an AI assistant integrated with AR glasses. Be concise and helpful.",
-            model=model,
+            model=model or "claude",
         )
         text = response
 
-    # Generate TTS and push to glasses
     try:
         audio = await elevenlabs_service.text_to_speech(text[:500])
         await stream_service.push_ai_response(text=text, audio_data=audio)
@@ -427,7 +495,6 @@ async def view_endpoint(websocket: WebSocket):
             try:
                 message = json.loads(data)
             except json.JSONDecodeError:
-                # Forward raw messages to glasses
                 for glasses in glasses_connections:
                     try:
                         await glasses.send_text(data)
@@ -438,22 +505,18 @@ async def view_endpoint(websocket: WebSocket):
             msg_type = message.get("type", "")
 
             if msg_type == "command":
-                # Command from web viewer to glasses
                 for glasses in glasses_connections:
                     try:
                         await glasses.send_text(data)
                     except Exception:
                         pass
             elif msg_type == "agent_command":
-                # Run agent from web UI
                 agent_type = message.get("agent", "")
                 task_input = message.get("task_input", {})
-                model = message.get("model", "claude")
+                model = message.get("model")
                 try:
                     at = AgentType(agent_type)
-                    agent = AGENTS[at]
-                    task_input["model"] = model
-                    result = await agent.run(task_input)
+                    result = await AGENTS[at].run(task_input, model=model)
                     await websocket.send_text(json.dumps({
                         "type": "agent_result",
                         "agent": agent_type,
@@ -465,7 +528,6 @@ async def view_endpoint(websocket: WebSocket):
                         "error": str(e),
                     }))
             else:
-                # Forward to glasses
                 for glasses in glasses_connections:
                     try:
                         await glasses.send_text(data)
