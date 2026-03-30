@@ -86,6 +86,9 @@ class WhisperService:
 
         Args:
             min_duration_ms: Minimum audio duration in ms before transcribing
+
+        Returns:
+            Dict with text, language, segments, and wav_data (raw WAV bytes for storage)
         """
         min_bytes = int(
             self._sample_rate * self._sample_width * self._channels * min_duration_ms / 1000
@@ -95,7 +98,11 @@ class WhisperService:
 
         wav_data = self.flush_buffer()
         if wav_data:
-            return await self.transcribe(wav_data)
+            result = await self.transcribe(wav_data)
+            result["wav_data"] = wav_data
+            duration_ms = int(len(wav_data) / (self._sample_rate * self._sample_width * self._channels) * 1000)
+            result["duration_ms"] = duration_ms
+            return result
         return None
 
     def _pcm_to_wav(self, pcm_data: bytes) -> bytes:

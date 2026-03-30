@@ -16,6 +16,7 @@ class Database:
         self._mem_agent_configs: dict[str, dict] = {}
         self._mem_pipeline_runs: list[dict] = []
         self._mem_task_results: list[dict] = []
+        self._mem_voice_sessions: list[dict] = []
 
     @property
     def connected(self) -> bool:
@@ -123,3 +124,41 @@ class Database:
         if agent_type:
             results = [r for r in results if r.get("agent_type") == agent_type]
         return results[-limit:][::-1]
+
+    # ── Voice Sessions ─────────────────────────────────────────────────────
+
+    async def save_voice_session(self, session_data: dict) -> str:
+        """Save a voice session with transcription and audio GCS reference.
+
+        Expected fields: session_id, transcription, segments, language,
+        duration_ms, audio_gcs_uri, audio_blob_name, audio_size_bytes, created_at
+        """
+        session_data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        if self._connected:
+            result = await self._db.voice_sessions.insert_one(session_data)
+            return str(result.inserted_id)
+        self._mem_voice_sessions.append(session_data)
+        return session_data.get("session_id", str(len(self._mem_voice_sessions)))
+
+    async def get_voice_sessions(self, limit: int = 50) -> list[dict]:
+        """Get recent voice sessions, newest first."""
+        if self._connected:
+            cursor = (
+                self._db.voice_sessions
+                .find({}, {"_id": 0})
+                .sort("created_at", -1)
+                .limit(limit)
+            )
+            return await cursor.to_list(length=limit)
+        return self._mem_voice_sessions[-limit:][::-1]
+
+    async def get_voice_session(self, session_id: str) -> dict | None:
+        """Get a single voice session by session_id."""
+        if self._connected:
+            return await self._db.voice_sessions.find_one(
+                {"session_id": session_id}, {"_id": 0}
+            )
+        for s in self._mem_voice_sessions:
+            if s.get("session_id") == session_id:
+                return s
+        return None

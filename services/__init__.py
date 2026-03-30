@@ -1,6 +1,7 @@
 from .ai_service import AIService
 from .cli_service import CLIService, CLIType
 from .database import Database
+from .gcs_service import GCSService
 from .whisper_service import WhisperService
 from .elevenlabs_service import ElevenLabsService
 from .whatsapp_service import WhatsAppService
@@ -11,6 +12,7 @@ __all__ = [
     "CLIService",
     "CLIType",
     "Database",
+    "GCSService",
     "WhisperService",
     "ElevenLabsService",
     "WhatsAppService",
