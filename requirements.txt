@@ -23,3 +23,10 @@ numpy>=1.26.0
 # MongoDB
 motor>=3.6.0
 pymongo>=4.10.0
+
+# Google Cloud Storage
+google-cloud-storage>=2.14.0
+
+# Auth
+workos>=5.0.0
+PyJWT>=2.8.0

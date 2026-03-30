@@ -5,13 +5,15 @@ import base64
 import json
 import os
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from workos import WorkOSClient
 
 load_dotenv()
 
@@ -30,6 +32,7 @@ from services import (
     AIService,
     CLIService,
     Database,
+    GCSService,
     ElevenLabsService,
     StreamService,
     WhatsAppService,
@@ -43,9 +46,20 @@ from services.cli_service import CLIType
 glasses_connections: set[WebSocket] = set()
 view_connections: set[WebSocket] = set()
 
+# ── WorkOS Auth ──────────────────────────────────────────────────────────────
+
+workos_client = WorkOSClient(
+    api_key=os.getenv("WORKOS_API_KEY", ""),
+    client_id=os.getenv("WORKOS_CLIENT_ID", ""),
+)
+
+# Map token -> user info for authenticated WebSocket connections
+authenticated_users: dict[str, dict] = {}
+
 db = Database()
 ai_service = AIService()
 cli_service = CLIService()
+gcs_service = GCSService()
 whisper_service = WhisperService()
 elevenlabs_service = ElevenLabsService()
 whatsapp_service = WhatsAppService()
@@ -104,13 +118,44 @@ async def lifespan(app: FastAPI):
 
     stream_service.subscribe_ai_response(broadcast_ai_response)
 
-    # Wire up audio stream → Whisper STT
+    # Wire up audio stream → Whisper STT → GCS + MongoDB persistence
     async def handle_audio(chunk):
         whisper_service.accumulate_audio(chunk.data)
         transcription = await whisper_service.transcribe_stream(min_duration_ms=3000)
         if transcription:
+            session_id = uuid.uuid4().hex
+            wav_data = transcription.pop("wav_data", None)
+            duration_ms = transcription.pop("duration_ms", 0)
+
+            # Upload audio to Google Cloud Storage (best-effort, non-blocking)
+            gcs_info = {}
+            if wav_data:
+                try:
+                    gcs_info = await gcs_service.upload_audio(
+                        wav_data, session_id=session_id
+                    )
+                except Exception as e:
+                    print(f"[GCS] Upload failed (non-fatal): {e}")
+
+            # Persist voice session to MongoDB
+            try:
+                await db.save_voice_session({
+                    "session_id": session_id,
+                    "transcription": transcription["text"],
+                    "segments": transcription.get("segments", []),
+                    "language": transcription.get("language"),
+                    "duration_ms": duration_ms,
+                    "audio_gcs_uri": gcs_info.get("gcs_uri"),
+                    "audio_blob_name": gcs_info.get("blob_name"),
+                    "audio_size_bytes": gcs_info.get("size_bytes"),
+                })
+            except Exception as e:
+                print(f"[DB] Save voice session failed (non-fatal): {e}")
+
+            # Broadcast transcription back to iOS app + web viewers
             await broadcast_ai_response({
                 "type": "transcription",
+                "session_id": session_id,
                 "text": transcription["text"],
                 "segments": transcription.get("segments", []),
             })
@@ -167,6 +212,42 @@ class TTSRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     audio_base64: str
     language: str | None = None
+
+
+class AuthCodeRequest(BaseModel):
+    code: str
+    redirect_uri: str | None = None
+
+
+# ── REST API: Auth ───────────────────────────────────────────────────────────
+
+@app.post("/auth/token")
+async def exchange_auth_code(request: AuthCodeRequest):
+    """Exchange a WorkOS authorization code for user profile + access token (used by iOS app)."""
+    try:
+        auth_response = workos_client.user_management.authenticate_with_code(
+            code=request.code,
+            session=None,
+        )
+        user = auth_response.user
+        access_token = auth_response.access_token
+
+        user_info = {
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+        }
+
+        # Cache for WebSocket auth
+        authenticated_users[access_token] = user_info
+
+        return {
+            "access_token": access_token,
+            "user": user_info,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── REST API: Status ──────────────────────────────────────────────────────────
@@ -401,12 +482,61 @@ async def speech_to_text(request: TranscribeRequest):
     return await whisper_service.transcribe(audio_data=audio_bytes, language=request.language)
 
 
+# ── REST API: Voice Sessions ──────────────────────────────────────────────────
+
+@app.get("/voice/sessions")
+async def list_voice_sessions(limit: int = 50):
+    """Get recent voice transcription sessions from MongoDB."""
+    sessions = await db.get_voice_sessions(limit=limit)
+    return {"sessions": sessions}
+
+
+@app.get("/voice/sessions/{session_id}")
+async def get_voice_session(session_id: str):
+    """Get a single voice session by ID."""
+    session = await db.get_voice_session(session_id)
+    if not session:
+        return {"error": "Session not found"}
+    return session
+
+
+@app.get("/voice/sessions/{session_id}/audio")
+async def get_voice_session_audio_url(session_id: str):
+    """Get a signed URL for the audio recording of a voice session."""
+    session = await db.get_voice_session(session_id)
+    if not session:
+        return {"error": "Session not found"}
+
+    blob_name = session.get("audio_blob_name")
+    if not blob_name:
+        return {"error": "No audio recording for this session"}
+
+    try:
+        url = gcs_service.get_signed_url(blob_name)
+        return {"url": url, "session_id": session_id}
+    except Exception as e:
+        return {"error": f"Could not generate URL: {e}"}
+
+
 # ── WebSocket: Glasses ────────────────────────────────────────────────────────
 
 @app.websocket("/glasses")
-async def glasses_endpoint(websocket: WebSocket):
+async def glasses_endpoint(websocket: WebSocket, token: str = Query(default="")):
     await websocket.accept()
+    # Attach user info if token provided
+    user = authenticated_users.get(token)
+    if user:
+        websocket.state.user = user
     glasses_connections.add(websocket)
+
+    # Notify viewers that glasses connected
+    status_msg = json.dumps({"type": "glasses_status", "connected": True, "count": len(glasses_connections)})
+    for view in view_connections:
+        try:
+            await view.send_text(status_msg)
+        except Exception:
+            pass
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -447,6 +577,14 @@ async def glasses_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         glasses_connections.discard(websocket)
+
+        # Notify viewers that glasses disconnected
+        status_msg = json.dumps({"type": "glasses_status", "connected": len(glasses_connections) > 0, "count": len(glasses_connections)})
+        for view in view_connections:
+            try:
+                await view.send_text(status_msg)
+            except Exception:
+                pass
 
 
 async def _handle_voice_command(command: str, model: str | None = None):
