@@ -528,6 +528,7 @@ async def glasses_endpoint(websocket: WebSocket, token: str = Query(default=""))
     if user:
         websocket.state.user = user
     glasses_connections.add(websocket)
+    print(f"[Glasses] Connected. Total: {len(glasses_connections)}")
 
     # Notify viewers that glasses connected
     status_msg = json.dumps({"type": "glasses_status", "connected": True, "count": len(glasses_connections)})
@@ -559,6 +560,7 @@ async def glasses_endpoint(websocket: WebSocket, token: str = Query(default=""))
             elif msg_type == "audio":
                 audio_b64 = message.get("data", "")
                 audio_bytes = base64.b64decode(audio_b64)
+                print(f"[Audio] Received {len(audio_bytes)} bytes")
                 await stream_service.push_audio_chunk(audio_bytes)
 
             elif msg_type == "command":
@@ -577,6 +579,7 @@ async def glasses_endpoint(websocket: WebSocket, token: str = Query(default=""))
 
     except WebSocketDisconnect:
         glasses_connections.discard(websocket)
+        print(f"[Glasses] Disconnected. Total: {len(glasses_connections)}")
 
         # Notify viewers that glasses disconnected
         status_msg = json.dumps({"type": "glasses_status", "connected": len(glasses_connections) > 0, "count": len(glasses_connections)})
