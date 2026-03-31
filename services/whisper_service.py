@@ -98,7 +98,7 @@ class WhisperService:
 
         wav_data = self.flush_buffer()
         if wav_data:
-            result = await self.transcribe(wav_data)
+            result = await self.transcribe(wav_data, language="en")
             result["wav_data"] = wav_data
             duration_ms = int(len(wav_data) / (self._sample_rate * self._sample_width * self._channels) * 1000)
             result["duration_ms"] = duration_ms
