@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import wave
 from typing import Any
 
+import numpy as np
 import openai
 
 
@@ -17,6 +19,7 @@ class WhisperService:
         self._sample_rate = 16000
         self._channels = 1
         self._sample_width = 2  # 16-bit audio
+        self._energy_threshold = 500  # RMS energy threshold for voice activity
 
     @property
     def client(self):
@@ -96,6 +99,11 @@ class WhisperService:
         if len(self._audio_buffer) < min_bytes:
             return None
 
+        # Voice Activity Detection — check if audio has enough energy
+        if not self._has_voice_activity(bytes(self._audio_buffer)):
+            self._audio_buffer.clear()
+            return None
+
         wav_data = self.flush_buffer()
         if wav_data:
             result = await self.transcribe(wav_data, language="en")
@@ -104,6 +112,17 @@ class WhisperService:
             result["duration_ms"] = duration_ms
             return result
         return None
+
+    def _has_voice_activity(self, pcm_data: bytes) -> bool:
+        """Check if PCM audio contains speech based on RMS energy."""
+        if len(pcm_data) < 2:
+            return False
+        samples = np.frombuffer(pcm_data, dtype=np.int16)
+        rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
+        has_voice = rms > self._energy_threshold
+        if not has_voice:
+            print(f"[VAD] Silence detected (RMS={rms:.0f}, threshold={self._energy_threshold})")
+        return has_voice
 
     def _pcm_to_wav(self, pcm_data: bytes) -> bytes:
         """Convert raw PCM audio data to WAV format."""
