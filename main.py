@@ -563,6 +563,36 @@ async def glasses_endpoint(websocket: WebSocket, token: str = Query(default=""))
                 print(f"[Audio] Received {len(audio_bytes)} bytes")
                 await stream_service.push_audio_chunk(audio_bytes)
 
+            elif msg_type == "transcription":
+                # Apple Speech or other on-device STT — save to MongoDB and broadcast
+                text = message.get("text", "")
+                source = message.get("source", "unknown")
+                if text.strip():
+                    session_id = uuid.uuid4().hex
+                    try:
+                        await db.save_voice_session({
+                            "session_id": session_id,
+                            "transcription": text,
+                            "source": source,
+                            "language": "en",
+                            "duration_ms": 0,
+                        })
+                    except Exception as e:
+                        print(f"[DB] Save voice session failed (non-fatal): {e}")
+
+                    # Broadcast to web viewers
+                    broadcast_msg = json.dumps({
+                        "type": "transcription",
+                        "session_id": session_id,
+                        "text": text,
+                        "source": source,
+                    })
+                    for view in view_connections:
+                        try:
+                            await view.send_text(broadcast_msg)
+                        except Exception:
+                            pass
+
             elif msg_type == "command":
                 command_text = message.get("text", "")
                 if command_text:
